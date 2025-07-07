@@ -132,11 +132,11 @@ class CGEModel:
         if vat_rate > 0:
             # Initial resource strain from increased enrollment
             if t <= 3:
-                resource_pressure_effect = -0.02
+                resource_pressure_effect = -0.02 * self.p.get('state_school_pressure_multiplier', 1.0)
                 self.state_school_quality[t] = max(0.8, self.state_school_quality[t-1] + resource_pressure_effect)
             else:
                 # Gradual system adaptation and potential policy responses
-                adaptation_improvement = 0.004
+                adaptation_improvement = 0.004 * self.p.get('state_school_adaptation_rate', 1.0)
                 target_quality = 1.0
                 current_quality = self.state_school_quality[t-1]
                 if current_quality < target_quality:
@@ -198,14 +198,27 @@ class CGEModel:
         """
         if with_vat:
             # Policy creates gradual increase in inequality through stratification mechanisms
-            omega = 0.019  # Based on empirical studies of educational segregation
+            omega = self.p.get('stratification_effect', 0.019)  # Now parameterized
 
             # Smooth transition reflecting gradual policy effects
             time_progress = (t + 1) / self.time_horizon
             adjustment_curve = 1 / (1 + np.exp(-6 * (time_progress - 0.4)))  # Sigmoid transition
 
-            inequality_adjustment = omega * adjustment_curve
-            self.gini_coefficient[t] = self.p['initial_gini'] + inequality_adjustment
+            # Add stochastic component to capture policy uncertainty
+            if 'inequality_shock_std' in self.p and self.p['inequality_shock_std'] > 0:
+                shock = np.random.normal(0, self.p['inequality_shock_std'])
+            else:
+                shock = 0
+
+            inequality_adjustment = (omega + shock) * adjustment_curve
+
+            # Also incorporate actual income distribution effects
+            empirical_gini = self._calculate_gini(self.income_by_quintile[:, t])
+            weight_empirical = self.p.get('empirical_gini_weight', 0.3)
+            weight_stratification = 1 - weight_empirical
+
+            self.gini_coefficient[t] = (weight_stratification * (self.p['initial_gini'] + inequality_adjustment) + 
+                                       weight_empirical * empirical_gini)
         else:
             # Baseline inequality from income distribution
             baseline_gini = self._calculate_gini(self.income_by_quintile[:, t])
@@ -293,7 +306,13 @@ def run_and_test():
         'gdp_growth_rate': 0.015,
         'family_investment_rate': 0.05,
         'family_investment_from_fees_factor': 0.20,
-        'hc_income_sensitivity': 0.5
+        'hc_income_sensitivity': 0.5,
+        # New parameters for improved Monte Carlo
+        'stratification_effect': 0.019,
+        'inequality_shock_std': 0.0,  # Will be set in Monte Carlo
+        'empirical_gini_weight': 0.3,
+        'state_school_pressure_multiplier': 1.0,
+        'state_school_adaptation_rate': 1.0
     }
     parameters['total_uk_pupils_initial'] = parameters['initial_private_enrollment'] / 0.07
     parameters['total_students_per_quintile_initial'] = parameters['total_uk_pupils_initial'] / 5
@@ -311,7 +330,7 @@ def run_and_test():
     print("\n--- Dynamic Equilibrium Results ---")
     print("Year | Gini | Priv Enroll | Q3-Q4 Exodus % | Q5 Decline % | Q4 Decline % | State Qual | Q5/Q3 HC Ratio")
     print("-" * 80)
-    for t in range(model_vat.time_horizon + 1):
+    for t in range(min(11, model_vat.time_horizon + 1)):  # Show first 11 years
         initial_enrollment_vat = results_vat['Private Enrollment']['Enrollment'].iloc[0]
         current_enrollment_vat = results_vat['Private Enrollment']['Enrollment'].iloc[t]
         enrollment_decline_pct = (initial_enrollment_vat - current_enrollment_vat) / initial_enrollment_vat * 100 if initial_enrollment_vat > 0 else 0
@@ -359,49 +378,180 @@ def run_and_test():
     print(f"\n3. Stratification Effects:")
     print(f"   - Middle-class exodus (Q3-Q4): {percent_exodus_q3_q4:.1f}%")
 
-    # Run Monte Carlo robustness analysis
-    print("\n--- Robustness Analysis (Monte Carlo) ---")
+    # Run improved Monte Carlo robustness analysis
+    print("\n--- Enhanced Robustness Analysis (Monte Carlo) ---")
+
+    # Comprehensive parameter distributions including key inequality drivers
     param_distributions = {
-        'hc_tfp': {'mean': 1.2, 'std': 0.12},
-        'hc_income_sensitivity': {'mean': 0.5, 'std': 0.05},
-        'skilled_premium_increase_factor': {'mean': 0.12, 'std': 0.012},
-        'network_premium': {'mean': 0.08, 'std': 0.008},
-        'human_capital_depreciation': {'mean': 0.02, 'std': 0.002},
-        'price_elasticities': {'mean': np.array([-1.8, -1.8, -1.1, -0.9, -0.2]), 'std': np.abs(np.array([-1.8, -1.8, -1.1, -0.9, -0.2])) * 0.1}
+        # Core structural parameters
+        'hc_tfp': {'mean': 1.2, 'std': 0.15},
+        'hc_income_sensitivity': {'mean': 0.5, 'std': 0.1},
+        'skilled_premium_increase_factor': {'mean': 0.12, 'std': 0.04},
+        'network_premium': {'mean': 0.08, 'std': 0.02},
+        'human_capital_depreciation': {'mean': 0.02, 'std': 0.005},
+
+        # Critical inequality parameters (previously missing)
+        'stratification_effect': {'mean': 0.019, 'std': 0.008},  # Key parameter!
+        'empirical_gini_weight': {'mean': 0.3, 'std': 0.1},
+
+        # Policy response parameters
+        'state_school_pressure_multiplier': {'mean': 1.0, 'std': 0.3},
+        'state_school_adaptation_rate': {'mean': 1.0, 'std': 0.4},
+
+        # Demand elasticities with correlation structure
+        'price_elasticities': {
+            'mean': np.array([-1.8, -1.8, -1.1, -0.9, -0.2]), 
+            'std': np.array([0.3, 0.3, 0.2, 0.15, 0.1])
+        },
+
+        # Initial conditions uncertainty
+        'initial_gini': {'mean': 0.33, 'std': 0.02},
+
+        # Stochastic shocks
+        'inequality_shock_std': {'mean': 0.002, 'std': 0.001}
     }
 
     monte_carlo_results = []
-    gini_increases = []  # Track Gini coefficient changes
+    gini_changes = []
+    enrollment_changes = []
+    final_ginis = []
 
-    for _ in range(1000):
+    np.random.seed(42)  # For reproducibility
+    n_simulations = 2000
+
+    for i in range(n_simulations):
+        if i % 200 == 0:
+            print(f"   Running simulation {i+1}/{n_simulations}...")
+
         params = parameters.copy()
+
+        # Sample parameters from distributions
         for param, dist in param_distributions.items():
             if param == 'price_elasticities':
-                params[param] = np.maximum(-2.0, dist['mean'] + np.random.normal(0, dist['std'], size=dist['mean'].shape))
+                # Sample elasticities with bounds to maintain economic realism
+                sampled = dist['mean'] + np.random.normal(0, dist['std'], size=dist['mean'].shape)
+                # Bound elasticities to reasonable ranges
+                params[param] = np.clip(sampled, [-2.5, -2.5, -1.8, -1.5, -0.8], [-0.8, -0.8, -0.4, -0.3, -0.05])
             else:
-                params[param] = max(0.01, np.random.normal(dist['mean'], dist['std']))
+                sampled = np.random.normal(dist['mean'], dist['std'])
+                # Apply reasonable bounds
+                if param == 'stratification_effect':
+                    params[param] = max(-0.005, min(0.05, sampled))  # Can be negative!
+                elif param == 'empirical_gini_weight':
+                    params[param] = max(0.0, min(1.0, sampled))
+                elif param == 'initial_gini':
+                    params[param] = max(0.25, min(0.45, sampled))
+                elif param == 'inequality_shock_std':
+                    params[param] = max(0.0, sampled)
+                else:
+                    params[param] = max(0.01, sampled)
 
-        model_mc = CGEModel(params)
-        model_mc.run_simulation(with_vat=True)
-        results_mc = model_mc.get_results()
+        try:
+            # Run simulation with sampled parameters
+            model_mc = CGEModel(params)
+            model_mc.run_simulation(with_vat=True)
+            results_mc = model_mc.get_results()
 
-        initial_gini = results_mc['Gini Coefficient']['Gini'].iloc[0]
-        final_gini = results_mc['Gini Coefficient']['Gini'].iloc[-1]
-        gini_change = final_gini - initial_gini
+            initial_gini = results_mc['Gini Coefficient']['Gini'].iloc[0]
+            final_gini = results_mc['Gini Coefficient']['Gini'].iloc[-1]
+            gini_change = final_gini - initial_gini
 
-        monte_carlo_results.append(final_gini)
-        gini_increases.append(gini_change > 0)
+            initial_enrollment = results_mc['Private Enrollment']['Enrollment'].iloc[0]
+            final_enrollment = results_mc['Private Enrollment']['Enrollment'].iloc[-1]
+            enrollment_change = (final_enrollment - initial_enrollment) / initial_enrollment * 100
 
-    mc_mean = np.mean(monte_carlo_results)
-    mc_std = np.std(monte_carlo_results)
-    mc_ci_lower = mc_mean - 1.96 * mc_std / np.sqrt(1000)
-    mc_ci_upper = mc_mean + 1.96 * mc_std / np.sqrt(1000)
+            monte_carlo_results.append({
+                'final_gini': final_gini,
+                'gini_change': gini_change,
+                'enrollment_change': enrollment_change,
+                'stratification_effect': params['stratification_effect']
+            })
 
-    # Calculate percentage of time Gini increases
-    percent_gini_increases = np.mean(gini_increases) * 100
+            gini_changes.append(gini_change)
+            enrollment_changes.append(enrollment_change)
+            final_ginis.append(final_gini)
 
-    print(f"Final Gini Coefficient: {mc_mean:.3f} (95% CI: [{mc_ci_lower:.3f}, {mc_ci_upper:.3f}])")
-    print(f"Percentage of simulations with Gini increase: {percent_gini_increases:.1f}%")
+        except Exception as e:
+            # Skip failed simulations
+            continue
+
+    # Convert to arrays for analysis
+    gini_changes = np.array(gini_changes)
+    enrollment_changes = np.array(enrollment_changes)
+    final_ginis = np.array(final_ginis)
+
+    # Comprehensive results analysis
+    print(f"\nMonte Carlo Results ({len(gini_changes)} successful simulations):")
+    print("=" * 60)
+
+    # Gini coefficient changes
+    gini_increases = np.sum(gini_changes > 0)
+    gini_decreases = np.sum(gini_changes < 0)
+    gini_no_change = np.sum(np.abs(gini_changes) < 0.001)
+
+    print(f"\nGini Coefficient Changes:")
+    print(f"  - Increases: {gini_increases} ({gini_increases/len(gini_changes)*100:.1f}%)")
+    print(f"  - Decreases: {gini_decreases} ({gini_decreases/len(gini_changes)*100:.1f}%)")
+    print(f"  - No change: {gini_no_change} ({gini_no_change/len(gini_changes)*100:.1f}%)")
+
+    print(f"\nGini Change Statistics:")
+    print(f"  - Mean: {np.mean(gini_changes):.4f}")
+    print(f"  - Std: {np.std(gini_changes):.4f}")
+    print(f"  - 95% CI: [{np.percentile(gini_changes, 2.5):.4f}, {np.percentile(gini_changes, 97.5):.4f}]")
+    print(f"  - Range: [{np.min(gini_changes):.4f}, {np.max(gini_changes):.4f}]")
+
+    print(f"\nFinal Gini Coefficient:")
+    print(f"  - Mean: {np.mean(final_ginis):.3f}")
+    print(f"  - Std: {np.std(final_ginis):.3f}")
+    print(f"  - 95% CI: [{np.percentile(final_ginis, 2.5):.3f}, {np.percentile(final_ginis, 97.5):.3f}]")
+
+    print(f"\nEnrollment Changes:")
+    print(f"  - Mean: {np.mean(enrollment_changes):.1f}%")
+    print(f"  - Std: {np.std(enrollment_changes):.1f}%")
+    print(f"  - 95% CI: [{np.percentile(enrollment_changes, 2.5):.1f}%, {np.percentile(enrollment_changes, 97.5):.1f}%]")
+
+    # Scenario analysis
+    print(f"\nScenario Analysis:")
+    large_increases = np.sum(gini_changes > 0.01)
+    moderate_increases = np.sum((gini_changes > 0.002) & (gini_changes <= 0.01))
+    small_changes = np.sum(np.abs(gini_changes) <= 0.002)
+    moderate_decreases = np.sum((gini_changes < -0.002) & (gini_changes >= -0.01))
+    large_decreases = np.sum(gini_changes < -0.01)
+
+    print(f"  - Large increases (>1.0pp): {large_increases} ({large_increases/len(gini_changes)*100:.1f}%)")
+    print(f"  - Moderate increases (0.2-1.0pp): {moderate_increases} ({moderate_increases/len(gini_changes)*100:.1f}%)")
+    print(f"  - Small changes (±0.2pp): {small_changes} ({small_changes/len(gini_changes)*100:.1f}%)")
+    print(f"  - Moderate decreases (-0.2 to -1.0pp): {moderate_decreases} ({moderate_decreases/len(gini_changes)*100:.1f}%)")
+    print(f"  - Large decreases (<-1.0pp): {large_decreases} ({large_decreases/len(gini_changes)*100:.1f}%)")
+
+    # Parameter sensitivity analysis
+    print(f"\nParameter Sensitivity (correlation with Gini change):")
+    mc_df = pd.DataFrame(monte_carlo_results)
+    correlations = {}
+    for param in ['stratification_effect']:
+        if param in mc_df.columns:
+            corr = np.corrcoef(mc_df[param], mc_df['gini_change'])[0,1]
+            correlations[param] = corr
+            print(f"  - {param}: {corr:.3f}")
+
+    # Policy implications
+    print(f"\nPolicy Risk Assessment:")
+    prob_increase = np.mean(gini_changes > 0) * 100
+    prob_large_increase = np.mean(gini_changes > 0.01) * 100
+    prob_decrease = np.mean(gini_changes < 0) * 100
+
+    print(f"  - Probability of increased inequality: {prob_increase:.1f}%")
+    print(f"  - Probability of large increase (>1pp): {prob_large_increase:.1f}%") 
+    print(f"  - Probability of decreased inequality: {prob_decrease:.1f}%")
+
+    if prob_increase > 80:
+        print(f"  - Assessment: HIGH RISK - Policy very likely to increase inequality")
+    elif prob_increase > 60:
+        print(f"  - Assessment: MODERATE-HIGH RISK - Policy likely to increase inequality")
+    elif prob_increase > 40:
+        print(f"  - Assessment: MIXED OUTCOMES - Uncertain effects")
+    else:
+        print(f"  - Assessment: LOW RISK - Policy unlikely to increase inequality")
 
 if __name__ == '__main__':
     run_and_test()
